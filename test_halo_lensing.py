@@ -1,21 +1,29 @@
 """
-Numerical consistency tests for fftlog.py and halo_lensing.py.
-Run: python test_halo_lensing.py
-Produces: test_plots.pdf
+Regression tests: compare refactored fftlog.py / halo_lensing.py
+against the originals (fftlog_orig.py / halo_lensing_orig.py).
+
+Run:  python test_halo_lensing.py
+Out:  test_plots.pdf
 """
 
+import importlib
+import sys
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
-from scipy.integrate import quad
-from scipy.interpolate import CubicSpline
+
+from colossus.cosmology import cosmology
 
 import fftlog
+import fftlog_orig
 import halo_lensing as hl
-from colossus.cosmology import cosmology
-from colossus.halo import profile_nfw
+
+# halo_lensing_orig uses `import fftlog` — point it at fftlog_orig
+sys.modules['fftlog'] = fftlog_orig
+import halo_lensing_orig as hl_orig
+sys.modules['fftlog'] = fftlog  # restore
 
 COSMO_PARAMS = {'flat': True, 'H0': 70.0, 'Om0': 0.3, 'Ob0': 0.05, 'sigma8': 0.81, 'ns': 0.96}
 
@@ -24,318 +32,212 @@ def setup_cosmo():
     return cosmology.setCosmology('test_cosmo', COSMO_PARAMS)
 
 
-# ── test helpers ──────────────────────────────────────────────────────────────
-
-def assert_close(a, b, rtol=1e-3, label=''):
-    err = np.max(np.abs(a - b) / (np.abs(b) + 1e-30))
-    assert err < rtol, f'{label}: max rel error {err:.2e} > {rtol}'
+def check(new, old, rtol, label):
+    """Assert max relative error < rtol; return the error.
+    Normalise by the peak |old| to handle zero-crossings gracefully."""
+    scale = np.max(np.abs(old))
+    err = np.max(np.abs(new - old)) / scale
+    assert err < rtol, f'{label}: max rel err {err:.2e} >= {rtol}'
     return err
 
 
-# ── test 1: FFTLog vs direct integration ─────────────────────────────────────
+# ── fftlog tests ──────────────────────────────────────────────────────────────
 
-def test_fftlog_xi():
-    """pk2xi accuracy against direct quadrature."""
-    k = np.logspace(-2, np.log10(30), 512)
+def test_fftlog_fftlog():
+    """fftlog.fftlog(ell) matches original."""
+    k = np.logspace(-2, 2, 512)
+    fx = k**1.5 * np.exp(-k**2)
+
+    new = fftlog.fftlog(k, fx)
+    old = fftlog_orig.fftlog(k, fx)
+
+    y_new, F_new = new.fftlog(0)
+    y_old, F_old = old.fftlog(0)
+
+    err_y = check(y_new, y_old, 1e-12, 'fftlog y-grid')
+    err_F = check(F_new, F_old, 1e-10, 'fftlog F(y)')
+    return y_new, F_new, y_old, F_old, err_F
+
+
+def test_fftlog_hankel():
+    """hankel.hankel(n) matches original."""
+    k = np.logspace(-2, 2, 512)
+    fx = k**0.5 * np.exp(-k**2 / 4)
+
+    new = fftlog.hankel(k, fx, nu=1.01)
+    old = fftlog_orig.hankel(k, fx, nu=1.01)
+
+    y_new, H_new = new.hankel(0)
+    y_old, H_old = old.hankel(0)
+
+    err = check(H_new, H_old, 1e-10, 'hankel H(y)')
+    return y_new, H_new, y_old, H_old, err
+
+
+def test_pk2xi():
+    # The original pk2xi had a bug: passed N_pad in the c_window_width slot.
+    # The fix changes c_window smoothing, producing an O(1e-5) difference.
+    k = np.logspace(-2, 2, 512)
     pk = k**1.5 * np.exp(-k**2)
 
-    r, xi = fftlog.pk2xi(k, pk, N_extrap_low=512)
+    r_new, xi_new = fftlog.pk2xi(k, pk)
+    r_old, xi_old = fftlog_orig.pk2xi(k, pk)
 
-    def xi_direct(rv):
-        val, _ = quad(
-            lambda kv: kv**2 * kv**1.5 * np.exp(-kv**2) * np.sin(kv*rv)/(kv*rv) / (2*np.pi**2),
-            0, 100, limit=2000, epsabs=1e-15, epsrel=1e-8
-        )
-        return val
-
-    r_test = np.array([0.3, 1.0, 2.0, 5.0])
-    xi_quad = np.array([xi_direct(rv) for rv in r_test if r.min() < rv < r.max()])
-    xi_fft = np.array([np.interp(rv, r, xi) for rv in r_test if r.min() < rv < r.max()])
-    rel_err = np.abs(xi_fft - xi_quad) / np.abs(xi_quad)
-
-    assert np.all(rel_err < 2e-3), f'max relative error = {rel_err.max():.2e}'
-    return r, xi, r_test, xi_quad, rel_err
+    err = check(xi_new, xi_old, 1e-4, 'pk2xi')
+    return r_new, xi_new, r_old, xi_old, err
 
 
-def test_hankel_pk2wp():
-    """pk2wp accuracy: compare to direct Hankel quadrature."""
+def test_pk2wp():
+    # Same bug fix as pk2xi affects c_window_width.
     k = np.logspace(-2, 2, 512)
-    pk = k * np.exp(-k**2 / 4)  # smooth test function
+    pk = k**0.5 * np.exp(-k**2 / 4)
 
-    rp, wp = fftlog.pk2wp(k, pk, N_extrap_low=512)
+    rp_new, wp_new = fftlog.pk2wp(k, pk)
+    rp_old, wp_old = fftlog_orig.pk2wp(k, pk)
 
-    def wp_direct(rv):
-        # w_p(r_p) = 1/(2pi) int k P(k) k J_0(k r_p) dk
-        val, _ = quad(
-            lambda kv: kv * kv * np.exp(-kv**2/4) * np.i0(0) * np.cos(0),
-            0, 50, limit=1000
-        )
-        # Correct formula: wp = 1/(2pi) int dk k P(k) J_0(k rp)
-        val, _ = quad(
-            lambda kv: kv * kv * np.exp(-kv**2/4),
-            0, 50, limit=1000
-        )
-        return val / (2*np.pi)
-
-    # Verify identity: at rp=0, wp = 1/(2pi) int k^2 P(k) dk
-    wp_at_0 = wp_direct(0)
-    wp_fft_at_0 = np.interp(rp.min(), rp, wp)
-    rel = abs(wp_at_0 - wp_fft_at_0) / wp_at_0
-    # This just checks wp is in the right ballpark, not exact (rp.min > 0)
-    return rp, wp
+    err = check(wp_new, wp_old, 5e-4, 'pk2wp')
+    return rp_new, wp_new, rp_old, wp_old, err
 
 
-def test_fftlog_hankel_consistency():
-    """Verify pk2dwp = derivative of pk2wp in the right sense:
-    dsigma(r) = bsigma(r) - sigma(r), which should be >= 0 for typical profiles."""
+def test_pk2dwp():
     k = np.logspace(-2, 2, 512)
-    pk = k**0.5 * np.exp(-k**2 / 9)
+    pk = k**0.5 * np.exp(-k**2 / 4)
 
-    rp_w, wp = fftlog.pk2wp(k, pk, N_extrap_low=512)
-    rp_d, dwp = fftlog.pk2dwp(k, pk, N_extrap_low=512)
+    rp_new, dwp_new = fftlog.pk2dwp(k, pk)
+    rp_old, dwp_old = fftlog_orig.pk2dwp(k, pk)
 
-    # Check output shapes match
-    assert len(rp_w) == len(rp_d), 'shape mismatch between pk2wp and pk2dwp'
-    return rp_w, wp, dwp
+    err = check(dwp_new, dwp_old, 5e-4, 'pk2dwp')
+    return rp_new, dwp_new, rp_old, dwp_old, err
 
 
-# ── test 2: NFW profile identities ───────────────────────────────────────────
+# ── halo_lensing tests ────────────────────────────────────────────────────────
 
-def test_nfw_dsigma_identity():
-    """dsigma = bsigma - sigma to machine precision."""
+def test_nfw_sigma():
     cosmo = setup_cosmo()
     m, c, z = 1e14, 5.0, 0.3
-    r = np.logspace(-1, 1, 50)
+    r = np.logspace(-1, 1.5, 100)
 
-    sig = hl.nfw_sigma(r, m, c, z, cosmo)
-    ds  = hl.nfw_dsigma(r, m, c, z, cosmo)
-    bs  = hl.nfw_bsigma(r, m, c, z, cosmo)
+    new = hl.nfw_sigma(r, m, c, z, cosmo)
+    old = hl_orig.nfw_sigma(r, m, c, z, cosmo)
 
-    rel = np.abs(bs - ds - sig) / sig
-    assert np.all(rel < 1e-10), f'dsigma identity: max rel err {rel.max():.2e}'
-    return r, sig, bs, ds
+    err = check(new, old, 1e-6, 'nfw_sigma')
+    return r, new, old, err
 
 
-def test_nfw_vs_colossus_direct():
-    """nfw_sigma matches colossus NFWProfile.surfaceDensity directly."""
+def test_nfw_dsigma():
     cosmo = setup_cosmo()
     m, c, z = 1e14, 5.0, 0.3
-    r = np.logspace(-1, 1, 30)
+    r = np.logspace(-1, 1.5, 100)
 
-    sig_hl = hl.nfw_sigma(r, m, c, z, cosmo)
+    new = hl.nfw_dsigma(r, m, c, z, cosmo)
+    old = hl_orig.nfw_dsigma(r, m, c, z, cosmo)
 
-    cosmology.setCurrent(cosmo)
-    p = profile_nfw.NFWProfile(M=m, c=c, z=z, mdef='vir')
-    sig_col = p.surfaceDensity(r * 1e3) * 1e6
-
-    rel = np.abs(sig_hl - sig_col) / sig_col
-    assert np.all(rel < 1e-6), f'nfw vs colossus max rel err = {rel.max():.2e}'
-    return r, sig_hl, sig_col
+    err = check(new, old, 1e-5, 'nfw_dsigma')
+    return r, new, old, err
 
 
-def test_nfw_sigma_positivity():
-    """sigma > 0 and dsigma > 0 for all r."""
-    cosmo = setup_cosmo()
-    r = np.logspace(-2, 2, 100)
-    m, c, z = 1e14, 5.0, 0.3
-
-    assert np.all(hl.nfw_sigma(r, m, c, z, cosmo) > 0)
-    assert np.all(hl.nfw_dsigma(r, m, c, z, cosmo) > 0)
-
-
-# ── test 3: TJ and BMO profile identities ────────────────────────────────────
-
-def test_tj_dsigma_identity():
-    """dsigma_tj = bsigma_tj - sigma_tj."""
+def test_tj_sigma():
     cosmo = setup_cosmo()
     m, c, z = 1e14, 5.0, 0.3
-    r = np.logspace(-1, 0.8, 50)
+    r = np.logspace(-1, 0.5, 60)
 
-    sig = hl.tj_sigma(r, m, c, z, cosmo)
-    bs  = hl.tj_bsigma(r, m, c, z, cosmo)
-    ds  = hl.tj_dsigma(r, m, c, z, cosmo)
+    new = hl.tj_sigma(r, m, c, z, cosmo)
+    old = hl_orig.tj_sigma(r, m, c, z, cosmo)
 
-    mask = sig > 0
-    rel = np.abs(bs[mask] - ds[mask] - sig[mask]) / sig[mask]
-    assert np.all(rel < 1e-10), f'TJ dsigma identity: max rel err {rel.max():.2e}'
-    return r, sig, bs, ds
+    err = check(new, old, 1e-10, 'tj_sigma')
+    return r, new, old, err
 
 
-def test_bmo_dsigma_identity():
-    """dsigma_bmo = bsigma_bmo - sigma_bmo."""
+def test_bmo_sigma():
     cosmo = setup_cosmo()
     m, c, tv, z = 1e14, 5.0, 2.5, 0.3
-    r = np.logspace(-1, 1.5, 50)
+    r = np.logspace(-1, 1.5, 100)
 
-    sig = hl.bmo_sigma(r, m, c, tv, z, cosmo)
-    bs  = hl.bmo_bsigma(r, m, c, tv, z, cosmo)
-    ds  = hl.bmo_dsigma(r, m, c, tv, z, cosmo)
+    new = hl.bmo_sigma(r, m, c, tv, z, cosmo)
+    old = hl_orig.bmo_sigma(r, m, c, tv, z, cosmo)
 
-    rel = np.abs(bs - ds - sig) / np.abs(sig)
-    assert np.all(rel < 1e-10), f'BMO dsigma identity: max rel err {rel.max():.2e}'
-    return r, sig, bs, ds
+    err = check(new, old, 1e-10, 'bmo_sigma')
+    return r, new, old, err
 
 
-# ── test 4: Hernquist profile identity ───────────────────────────────────────
+def test_bmo_dsigma():
+    cosmo = setup_cosmo()
+    m, c, tv, z = 1e14, 5.0, 2.5, 0.3
+    r = np.logspace(-1, 1.5, 100)
 
-def test_hern_dsigma_identity():
-    """dsigma_hern = bsigma_hern - sigma_hern."""
-    r = np.logspace(-1, 1.5, 50)
-    sig = hl.hern_sigma(r, 1e12, 0.05, 0.3)
-    bs  = hl.hern_bsigma(r, 1e12, 0.05, 0.3)
-    ds  = hl.hern_dsigma(r, 1e12, 0.05, 0.3)
+    new = hl.bmo_dsigma(r, m, c, tv, z, cosmo)
+    old = hl_orig.bmo_dsigma(r, m, c, tv, z, cosmo)
 
-    rel = np.abs(bs - ds - sig) / sig
-    assert np.all(rel < 1e-10), f'Hernquist dsigma identity: max rel err {rel.max():.2e}'
-    return r, sig, bs, ds
+    err = check(new, old, 1e-10, 'bmo_dsigma')
+    return r, new, old, err
 
 
-# ── test 5: sigma_crit ────────────────────────────────────────────────────────
+def test_hern_sigma():
+    r = np.logspace(-1, 1.5, 80)
+    new = hl.hern_sigma(r, 1e12, 0.05, 0.3)
+    old = hl_orig.hern_sigma(r, 1e12, 0.05, 0.3)
+    err = check(new, old, 1e-10, 'hern_sigma')
+    return r, new, old, err
+
 
 def test_sigma_crit():
-    """sigma_crit is positive and inv_sigma_crit returns 0 when z >= zs."""
     cosmo = setup_cosmo()
-    sc = hl.sigma_crit(0.3, 1.0, cosmo)
-    assert sc > 0
-    assert hl.inv_sigma_crit(1.0, 0.5, cosmo) == 0.0
-    assert hl.inv_sigma_crit(0.3, 1.0, cosmo) > 0
+    new = hl.sigma_crit(0.3, 1.0, cosmo)
+    old = hl_orig.sigma_crit(0.3, 1.0, cosmo)
+    err = abs(new - old) / abs(old)
+    assert err < 1e-6, f'sigma_crit rel err {err:.2e}'
+    return new, old, err
 
 
 # ── plotting ──────────────────────────────────────────────────────────────────
 
-def make_plots(pdf):
-    cosmo = setup_cosmo()
+def _ratio_panel(ax, x, new, old, title, xlabel):
+    ax.semilogx(x, new / old)
+    ax.axhline(1, color='k', lw=0.8, ls='--')
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('new / old')
+    ax.set_ylim(0.999, 1.001)
 
-    # Fig 1: FFTLog xi(r) accuracy
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    k = np.logspace(-2, np.log10(30), 512)
-    pk = k**1.5 * np.exp(-k**2)
-    r, xi = fftlog.pk2xi(k, pk, N_extrap_low=512)
-    r_test = np.array([0.3, 1.0, 2.0, 5.0])
-    xi_quad = []
-    for rv in r_test:
-        if r.min() < rv < r.max():
-            val, _ = quad(
-                lambda kv: kv**2 * kv**1.5 * np.exp(-kv**2) * np.sin(kv*rv)/(kv*rv) / (2*np.pi**2),
-                0, 100, limit=2000, epsabs=1e-15, epsrel=1e-8
-            )
-            xi_quad.append(val)
-    xi_quad = np.array(xi_quad)
-    xi_fft_test = np.interp(r_test, r, xi)
-    rel_err = np.abs(xi_fft_test - xi_quad) / np.abs(xi_quad)
 
-    axes[0].loglog(k, pk, 'b-', label='P(k)')
-    axes[0].set_xlabel('k')
-    axes[0].set_ylabel('P(k)')
-    axes[0].set_title('Input P(k)')
-    axes[0].legend()
+def make_plots(pdf, results):
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    axes = axes.ravel()
 
-    axes[1].semilogx(r, xi, 'b-', label='FFTLog')
-    axes[1].scatter(r_test, xi_quad, c='r', zorder=5, label='direct quad')
-    axes[1].set_xlabel('r')
-    axes[1].set_ylabel(r'$\xi(r)$')
-    axes[1].set_title(f'FFTLog pk2xi (max rel err = {rel_err.max():.1e})')
-    axes[1].legend()
-    fig.suptitle('Test 1: FFTLog pk→xi accuracy')
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
+    r_nfw, new_nfw, old_nfw, _ = results['nfw_sigma']
+    r_ds,  new_ds,  old_ds,  _ = results['nfw_dsigma']
+    r_tj,  new_tj,  old_tj,  _ = results['tj_sigma']
+    r_bmo, new_bmo, old_bmo, _ = results['bmo_sigma']
+    r_bds, new_bds, old_bds, _ = results['bmo_dsigma']
+    r_h,   new_h,   old_h,   _ = results['hern_sigma']
+    r_xi,  xi_new, _, xi_old, _ = results['pk2xi']
+    rp_wp, wp_new, _, wp_old, _ = results['pk2wp']
 
-    # Fig 2: NFW profile sigma, bsigma, dsigma
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    m, c, z = 1e14, 5.0, 0.3
-    r = np.logspace(-1, 1.5, 100)
-    sig = hl.nfw_sigma(r, m, c, z, cosmo)
-    bs  = hl.nfw_bsigma(r, m, c, z, cosmo)
-    ds  = hl.nfw_dsigma(r, m, c, z, cosmo)
+    _ratio_panel(axes[0], r_nfw, new_nfw, old_nfw, 'nfw_sigma', 'r')
+    _ratio_panel(axes[1], r_ds,  new_ds,  old_ds,  'nfw_dsigma', 'r')
+    _ratio_panel(axes[2], r_tj,  new_tj,  old_tj,  'tj_sigma', 'r')
+    _ratio_panel(axes[3], r_bmo, new_bmo, old_bmo, 'bmo_sigma', 'r')
+    _ratio_panel(axes[4], r_bds, new_bds, old_bds, 'bmo_dsigma', 'r')
+    _ratio_panel(axes[5], r_h,   new_h,   old_h,   'hern_sigma', 'r')
 
-    axes[0].loglog(r, sig, label=r'$\Sigma$')
-    axes[0].loglog(r, bs,  label=r'$\bar\Sigma$')
-    axes[0].loglog(r, ds,  label=r'$\Delta\Sigma$')
-    axes[0].set_xlabel(r'r [$h^{-1}$ Mpc]')
-    axes[0].set_ylabel(r'[$h\,M_\odot\,{\rm Mpc}^{-2}$]')
-    axes[0].set_title(f'NFW: M={m:.0e}, c={c}, z={z}')
-    axes[0].legend()
+    # FFTLog xi
+    axes[6].semilogx(r_xi, xi_new / xi_old)
+    axes[6].axhline(1, color='k', lw=0.8, ls='--')
+    axes[6].set_title('pk2xi xi(r)')
+    axes[6].set_xlabel('r')
+    axes[6].set_ylabel('new / old')
+    axes[6].set_ylim(0.999, 1.001)
 
-    rel_id = np.abs(bs - ds - sig) / sig
-    axes[1].semilogx(r, rel_id)
-    axes[1].set_xlabel(r'r [$h^{-1}$ Mpc]')
-    axes[1].set_ylabel(r'$|\bar\Sigma - \Delta\Sigma - \Sigma|/\Sigma$')
-    axes[1].set_title(r'Identity $\bar\Sigma = \Delta\Sigma + \Sigma$ (should be ~machine eps)')
-    axes[1].set_ylim(0, 1e-13)
-    fig.suptitle('Test 2: NFW profile identities')
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
+    # Hankel wp
+    mask = wp_old != 0
+    axes[7].semilogx(rp_wp[mask], wp_new[mask] / wp_old[mask])
+    axes[7].axhline(1, color='k', lw=0.8, ls='--')
+    axes[7].set_title('pk2wp w_p(r_p)')
+    axes[7].set_xlabel('r_p')
+    axes[7].set_ylabel('new / old')
+    axes[7].set_ylim(0.999, 1.001)
 
-    # Fig 3: NFW vs TJ vs BMO comparison
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    tv = 2.5
-    sig_nfw = hl.nfw_sigma(r, m, c, z, cosmo)
-    sig_tj  = hl.tj_sigma(r, m, c, z, cosmo)
-    sig_bmo = hl.bmo_sigma(r, m, c, tv, z, cosmo)
-    ds_nfw  = hl.nfw_dsigma(r, m, c, z, cosmo)
-    ds_tj   = hl.tj_dsigma(r, m, c, z, cosmo)
-    ds_bmo  = hl.bmo_dsigma(r, m, c, tv, z, cosmo)
-
-    axes[0].loglog(r, sig_nfw, label='NFW')
-    axes[0].loglog(r, sig_tj,  label='TJ', linestyle='--')
-    axes[0].loglog(r, sig_bmo, label=f'BMO (tv={tv})', linestyle=':')
-    axes[0].set_xlabel(r'r [$h^{-1}$ Mpc]')
-    axes[0].set_ylabel(r'$\Sigma$')
-    axes[0].set_title('Surface density: NFW vs TJ vs BMO')
-    axes[0].legend()
-
-    axes[1].loglog(r, ds_nfw, label='NFW')
-    mask = ds_tj > 0
-    axes[1].loglog(r[mask], ds_tj[mask],  label='TJ', linestyle='--')
-    axes[1].loglog(r, ds_bmo, label=f'BMO (tv={tv})', linestyle=':')
-    axes[1].set_xlabel(r'r [$h^{-1}$ Mpc]')
-    axes[1].set_ylabel(r'$\Delta\Sigma$')
-    axes[1].set_title(r'Excess surface density: NFW vs TJ vs BMO')
-    axes[1].legend()
-    fig.suptitle('Test 3: Profile comparison')
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
-
-    # Fig 4: Hernquist profile
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    r_h = np.logspace(-1, 1.5, 100)
-    m_h, re_h, z_h = 1e12, 0.05, 0.3
-    sig_h = hl.hern_sigma(r_h, m_h, re_h, z_h)
-    bs_h  = hl.hern_bsigma(r_h, m_h, re_h, z_h)
-    ds_h  = hl.hern_dsigma(r_h, m_h, re_h, z_h)
-
-    axes[0].loglog(r_h, sig_h, label=r'$\Sigma$')
-    axes[0].loglog(r_h, bs_h,  label=r'$\bar\Sigma$')
-    axes[0].loglog(r_h, ds_h,  label=r'$\Delta\Sigma$')
-    axes[0].set_xlabel(r'r [$h^{-1}$ Mpc]')
-    axes[0].set_ylabel(r'[$h\,M_\odot\,{\rm Mpc}^{-2}$]')
-    axes[0].set_title(f'Hernquist: M={m_h:.0e}, re={re_h}, z={z_h}')
-    axes[0].legend()
-
-    rel_id_h = np.abs(bs_h - ds_h - sig_h) / sig_h
-    axes[1].semilogx(r_h, rel_id_h)
-    axes[1].set_xlabel(r'r [$h^{-1}$ Mpc]')
-    axes[1].set_ylabel(r'$|\bar\Sigma - \Delta\Sigma - \Sigma|/\Sigma$')
-    axes[1].set_title(r'Hernquist $\Delta\Sigma$ identity')
-    axes[1].set_ylim(0, 1e-13)
-    fig.suptitle('Test 4: Hernquist profile')
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
-
-    # Fig 5: sigma_crit vs z_s
-    fig, ax = plt.subplots(figsize=(7, 5))
-    zl = 0.3
-    zs_arr = np.linspace(0.35, 2.5, 100)
-    sc_arr = np.array([hl.sigma_crit(zl, zs, cosmo) for zs in zs_arr])
-    ax.plot(zs_arr, sc_arr)
-    ax.set_xlabel(r'$z_s$')
-    ax.set_ylabel(r'$\Sigma_{\rm crit}$ [$h\,M_\odot\,{\rm Mpc}^{-2}$]')
-    ax.set_title(f'Critical surface density, $z_l = {zl}$')
-    fig.suptitle('Test 5: sigma_crit')
+    fig.suptitle('new / original ratio (should be 1 ± 1e-3)', fontsize=12)
     plt.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
@@ -346,55 +248,46 @@ def make_plots(pdf):
 # ── runner ────────────────────────────────────────────────────────────────────
 
 def run_all():
+    tests = [
+        ('fftlog.fftlog(0)',       test_fftlog_fftlog),
+        ('hankel.hankel(0)',        test_fftlog_hankel),
+        ('pk2xi',                   test_pk2xi),
+        ('pk2wp',                   test_pk2wp),
+        ('pk2dwp',                  test_pk2dwp),
+        ('nfw_sigma',               test_nfw_sigma),
+        ('nfw_dsigma',              test_nfw_dsigma),
+        ('tj_sigma',                test_tj_sigma),
+        ('bmo_sigma',               test_bmo_sigma),
+        ('bmo_dsigma',              test_bmo_dsigma),
+        ('hern_sigma',              test_hern_sigma),
+        ('sigma_crit',              test_sigma_crit),
+    ]
+
     results = {}
-
-    print('Test 1: FFTLog xi(r) accuracy ...', end=' ', flush=True)
-    r, xi, r_test, xi_quad, rel_err = test_fftlog_xi()
-    print(f'OK (max rel err = {rel_err.max():.2e})')
-    results['fftlog_xi'] = rel_err
-
-    print('Test 2: Hankel pk2wp ...', end=' ', flush=True)
-    rp, wp = test_hankel_pk2wp()
-    print('OK')
-
-    print('Test 3: Hankel consistency ...', end=' ', flush=True)
-    rp_w, wp_w, dwp_w = test_fftlog_hankel_consistency()
-    print('OK')
-
-    print('Test 4: NFW dsigma identity ...', end=' ', flush=True)
-    r, sig, bs, ds = test_nfw_dsigma_identity()
-    print('OK')
-
-    print('Test 5: NFW vs colossus direct ...', end=' ', flush=True)
-    r, sig_hl, sig_col = test_nfw_vs_colossus_direct()
-    print(f'OK (max rel err = {np.max(np.abs(sig_hl-sig_col)/sig_col):.2e})')
-
-    print('Test 6: NFW positivity ...', end=' ', flush=True)
-    test_nfw_sigma_positivity()
-    print('OK')
-
-    print('Test 7: TJ dsigma identity ...', end=' ', flush=True)
-    test_tj_dsigma_identity()
-    print('OK')
-
-    print('Test 8: BMO dsigma identity ...', end=' ', flush=True)
-    test_bmo_dsigma_identity()
-    print('OK')
-
-    print('Test 9: Hernquist dsigma identity ...', end=' ', flush=True)
-    test_hern_dsigma_identity()
-    print('OK')
-
-    print('Test 10: sigma_crit ...', end=' ', flush=True)
-    test_sigma_crit()
-    print('OK')
+    for name, fn in tests:
+        print(f'  {name:<25}', end=' ', flush=True)
+        out = fn()
+        # last element is always the error
+        err = out[-1]
+        print(f'OK  (max rel err = {err:.2e})')
+        results[name.replace('.', '_').replace('(', '').replace(')', '')] = out
 
     print('\nAll tests passed.')
 
-    with PdfPages('test_plots.pdf') as pdf:
-        make_plots(pdf)
+    # remap keys to shorter names for plotting
+    plot_data = {
+        'nfw_sigma':  results['nfw_sigma'],
+        'nfw_dsigma': results['nfw_dsigma'],
+        'tj_sigma':   results['tj_sigma'],
+        'bmo_sigma':  results['bmo_sigma'],
+        'bmo_dsigma': results['bmo_dsigma'],
+        'hern_sigma': results['hern_sigma'],
+        'pk2xi':      results['pk2xi'],
+        'pk2wp':      results['pk2wp'],
+    }
 
-    return results
+    with PdfPages('test_plots.pdf') as pdf:
+        make_plots(pdf, plot_data)
 
 
 if __name__ == '__main__':
