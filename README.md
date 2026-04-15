@@ -1,6 +1,6 @@
 # halo_lensing
 
-Weak lensing profiles for NFW, Takada-Jain (TJ), Baltz-Marshall-Oguri (BMO), and Hernquist halos, plus a 2-halo term. Includes FFT-based off-centering via a bundled FFTLog implementation.
+Weak lensing profiles for NFW, Takada-Jain (TJ), Baltz-Marshall-Oguri (BMO), and Hernquist halos, plus a 2-halo term. Includes FFT-based off-centering via a bundled [FFTLog implementation](https://github.com/xfangcosmo/FFTLog-and-beyond).
 
 Uses [colossus](https://bitbucket.org/bdiemer/colossus) for cosmology, distances, power spectra, and NFW projected profiles.
 
