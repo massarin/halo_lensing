@@ -212,20 +212,22 @@ def m_nfw(x):
 #
 # projected TJ profiles
 #
+# prefactor 4*rho_s*r_s = m / (pi * r_s^2 * m_nfw(c)): consistent with tj_sigma_f (total mass m)
+#
 def tj_sigma(r, m, c, z, cosmo, mdef = 'vir', comoving = False):
     crhos, crs = calc_crhos_crs(m, c, z, cosmo, mdef, comoving)
     
-    return (m / (np.pi * crs * crs)) * tj_sigma_dl(r / crs, c)
+    return 4.0 * crhos * crs * tj_sigma_dl(r / crs, c)
 
 def tj_bsigma(r, m, c, z, cosmo, mdef = 'vir', comoving = False):
     crhos, crs = calc_crhos_crs(m, c, z, cosmo, mdef, comoving)
     
-    return (m / (np.pi * crs * crs)) * tj_bsigma_dl(r / crs, c)
+    return 4.0 * crhos * crs * tj_bsigma_dl(r / crs, c)
 
 def tj_dsigma(r, m, c, z, cosmo, mdef = 'vir', comoving = False):
     crhos, crs = calc_crhos_crs(m, c, z, cosmo, mdef, comoving)
     
-    return (m / (np.pi * crs * crs)) * tj_dsigma_dl(r / crs, c)
+    return 4.0 * crhos * crs * tj_dsigma_dl(r / crs, c)
 
 #
 # convergence and shear
