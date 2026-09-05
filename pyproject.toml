@@ -6,6 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "halo_lensing"
 version = "1.0.0"
 description = "Weak lensing profiles for NFW, TJ, BMO, and Hernquist halos, with FFTLog off-centering"
+authors = [
+    { name = "Masamune Oguri" },  # halo_lensing, MIT LICENSE holder
+    { name = "Xiao Fang" },       # FFTLog-and-beyond, bundled as fftlog.py
+]
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
