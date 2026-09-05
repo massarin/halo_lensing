@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "halo_lensing"
+version = "1.0.0"
+description = "Weak lensing profiles for NFW, TJ, BMO, and Hernquist halos, with FFTLog off-centering"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "astropy",
+    "colossus",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "matplotlib"]
+
+[tool.setuptools]
+# flat layout: top-level modules, no package dir
+py-modules = ["halo_lensing", "fftlog"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
